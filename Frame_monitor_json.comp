@@ -58,7 +58,7 @@ SHARE
 
 json_object * frame_monitor_setup_json(json_object * root, double period, double tick, int nt) {
   char xvar[] = "t";
-  char xlabel[] = "Time-of-flight [\\gms]";
+  char xlabel[] = "Time-of-flight [microsecond]";
   char ylabel[] = "Intensity";
   char buf[1024];
 
