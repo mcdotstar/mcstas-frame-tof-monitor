@@ -5,8 +5,6 @@ from pathlib import Path
 from textwrap import dedent
 from pytest import mark, skip
 from mccode_antlr import Flavor
-from scipp import Variable
-
 
 
 class MockKafkaServer:
