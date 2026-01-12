@@ -1,10 +1,152 @@
+import sys
 import time
 from contextlib import ContextDecorator, contextmanager
 from pathlib import Path
 from textwrap import dedent
-from pytest import mark
+from pytest import mark, skip
 from mccode_antlr import Flavor
 from scipp import Variable
+
+
+
+class MockKafkaServer:
+    """Lightweight Kafka broker using Redpanda in Docker via testcontainers
+    
+    This class automatically works with both Docker and Podman.
+    
+    For Podman users: 
+    1. Enable the Podman socket:
+        systemctl --user enable --now podman.socket
+    
+    2. Set DOCKER_HOST environment variable before running tests:
+        export DOCKER_HOST=unix:///run/user/$UID/podman/podman.sock
+    
+    The Ryuk reaper container is automatically disabled for Podman compatibility.
+    """
+    def __init__(self, topic):
+        self.topic = topic
+        self.container = None
+        
+    def start(self):
+        """Start a Redpanda container (Kafka-compatible broker)"""
+        # Ensure Podman socket is accessible if using Podman
+        import os
+        if not os.environ.get('DOCKER_HOST'):
+            # Try to set DOCKER_HOST for Podman if socket exists
+            podman_sock = f"unix:///run/user/{os.getuid()}/podman/podman.sock"
+            if os.path.exists(f"/run/user/{os.getuid()}/podman/podman.sock"):
+                os.environ['DOCKER_HOST'] = podman_sock
+        
+        # Disable Ryuk (reaper container) for Podman compatibility
+        # Ryuk is used for cleanup but can cause connection issues with Podman
+        os.environ['TESTCONTAINERS_RYUK_DISABLED'] = 'true'
+        
+        try:
+            from testcontainers.kafka import RedpandaContainer
+        except ImportError:
+            raise ImportError(
+                "testcontainers is required for Kafka integration tests. "
+                "Install with: pip install testcontainers"
+            )
+        
+        
+        # Start Redpanda container (lightweight Kafka-compatible broker)
+        self.container = RedpandaContainer()
+        self.container.start()
+        
+        # Get the bootstrap server address
+        broker = self.container.get_bootstrap_server()
+        return broker
+    
+    def stop(self):
+        """Stop the Redpanda container"""
+        if self.container:
+            self.container.stop()
+    
+    def get_messages(self):
+        """Consume and return all messages from the topic"""
+        if not self.container:
+            return []
+        
+        try:
+            from confluent_kafka import Consumer, KafkaError
+            
+            # Create a consumer to read messages from the topic
+            consumer = Consumer({
+                'bootstrap.servers': self.container.get_bootstrap_server(),
+                'group.id': 'test_consumer',
+                'auto.offset.reset': 'earliest',
+                'enable.auto.commit': False
+            })
+            
+            # Subscribe to the topic
+            consumer.subscribe([self.topic])
+            
+            # Collect all messages (timeout after 5 seconds of no messages)
+            messages = []
+            timeout = 5.0
+            
+            while True:
+                msg = consumer.poll(timeout)
+                if msg is None:
+                    break  # No more messages
+                
+                if msg.error():
+                    if msg.error().code() == KafkaError._PARTITION_EOF:
+                        break  # End of partition
+                    else:
+                        print(f"Consumer error: {msg.error()}")
+                        continue
+                
+                # Message received successfully
+                messages.append(msg.value())
+            
+            consumer.close()
+            return messages
+            
+        except ImportError:
+            print("Warning: confluent_kafka not available for consuming messages")
+            return []
+        except Exception as e:
+            print(f"Error consuming messages: {e}")
+            return []
+
+
+@contextmanager
+def make_kafka_server(topic, source):
+    """Manage running a mock Kafka server with a single topic expecting only messages from one source"""
+    mock = MockKafkaServer(topic)
+    broker = mock.start()
+    try:
+        yield broker, mock
+    finally:
+        mock.stop()
+
+
+def get_data(mock):
+    """Get data from the Kafka broker and deserialize FlatBuffer messages"""
+    from streaming_data_types.dataarray_da00 import deserialise_da00
+    
+    messages = mock.get_messages()
+    
+    if not messages:
+        return None
+    
+    # Try to deserialize each message as a FlatBuffer
+    for idx, msg_data in enumerate(messages):
+        if not isinstance(msg_data, bytes):
+            continue
+        
+        try:
+            # Try to deserialize directly
+            result = deserialise_da00(msg_data)
+            if result is not None:
+                return result
+        except Exception as e:
+            continue
+    
+    return None
+    
 
 
 class Timer(ContextDecorator):
@@ -29,6 +171,16 @@ def compiled(method):
     def skipped_method(*args, **kwargs):
         return method(*args, **kwargs)
     return skipped_method
+
+
+def containered(method):
+    import sys
+    if sys.platform.startswith("linux"):
+        return method
+    @mark.skip(reason="No CI Docker/Podman/etc. except for Linux")
+    def skipped(*args, **kwargs):
+        return method(*args, **kwargs)
+    return skipped
 
 
 def time_compile_and_run(instr,
@@ -78,26 +230,10 @@ def this_registry():
         raise RuntimeError(f"Unable to identify base repository, {ex}")
 
 
-def get_registries():
-    from mccode_antlr.reader import GitHubRegistry
-
-    registries = [
-        'mccode-mcpl-filter',
-    ]
-    registries = [GitHubRegistry(
-        name,
-        url=f'https://github.com/mcdotstar/{name}',
-        filename='pooch-registry.txt',
-        version='main'
-    ) for name in registries]
-
-    return registries + [this_registry()]
-
-
 def primary(command: str):
     from mccode_antlr.assembler import Assembler
-    name = 'test_frame_montitor_json'
-    a = Assembler(name, flavor=Flavor.MCSTAS, registries=get_registries())
+    name = 'test_frame_monitor_json'
+    a = Assembler(name, flavor=Flavor.MCSTAS, registries=[this_registry()])
     a.parameter('int dummy/"s"=0')
 
     origin = a.component("origin", "Progress_bar")
@@ -114,10 +250,10 @@ def primary(command: str):
     return a.instrument
 
 
+@compiled
 def test_frame_monitor_echos():
     from mccode_to_kafka.datfile import DatFileCommon
     instr = primary(command='"echo json = "')
-    cmds = '-n 1000 dummy=0'
     times, output = time_compile_and_run(instr, '-n 1000 dummy=0', run=True)
     stdout, stderr = output
     for line in stdout.decode().splitlines():
@@ -126,29 +262,22 @@ def test_frame_monitor_echos():
             assert sum(dat["N"]) == 1000
 
 
-@contextmanager
-def make_kafka_server(topic, source):
-    """Manage running a Kafka server with a single topic expecting only messages from one source"""
-    resource = acquire_temporary_kafka_server(topic, source)
-    try:
-        yield resource
-    finally:
-        release_temporary_kafka_server(resource)
-
-
-def get_data(broker, topic, source):
-    pass
-
-
-def do_not_test_frame_monitor_integrates():
+@containered
+@compiled
+def test_frame_monitor_integrates():
     from mccode_to_kafka.datfile import DatFileCommon
-    # setup a temporary Kafka server ?!
+    # setup a temporary mock Kafka server
     topic, source = 'temp_monitors', 'monitor'
-    with make_kakfa_server(topic, source) as broker:
+    with make_kafka_server(topic, source) as (broker, mock):
         instr = primary(command=f'"mccode-to-kafka json --broker {broker} --topic {topic} --source {source}"')
         times, output = time_compile_and_run(instr, '-n 1000 dummy=0', run=True)
-        dat = get_data(broker, topic, source)
-        assert sum(dat["N"]) == 1000
+        da00 = get_data(mock)
+        assert da00 is not None
+        
+        data = {v.name: v for v in da00.data}
+        assert all(x in data for x in ('t', 'signal', 'signal_errors'))
+        assert len(data['signal'].data) == 10
+        assert len(data['t'].data) == 11
 
 
 

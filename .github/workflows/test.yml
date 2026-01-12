@@ -20,6 +20,12 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: conda-incubator/setup-miniconda@v3
+        with:
+          python-version: ${{ matrix.python-version }}
+          environment-file: environment.yml
+          activate-environment: test
 
       - name: Test
+        shell: bash -l {0}
         run: python -m pytest -s -v
+

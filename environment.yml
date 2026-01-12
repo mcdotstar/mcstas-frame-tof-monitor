@@ -8,5 +8,6 @@ dependencies:
   - c-compiler
   - pytest
   - gitpython
+  - testcontainers
   - pip:
     - mccode-to-kafka
