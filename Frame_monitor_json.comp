@@ -54,7 +54,11 @@ DEPENDENCY "-ljson-c"
 
 SHARE
 %{
+#ifdef __APPLE__
+#include <json/json.h>
+#else
 #include <json-c/json.h>
+#endif
 
 json_object * frame_monitor_setup_json(json_object * root, double period, double tick, int nt) {
   char xvar[] = "t";
