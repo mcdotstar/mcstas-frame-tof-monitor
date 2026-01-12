@@ -1,0 +1,240 @@
+/*******************************************************************************
+*
+* McStas, neutron ray-tracing package
+*         Copyright 1997-2002, All rights reserved
+*         Risoe National Laboratory, Roskilde, Denmark
+*         Institut Laue Langevin, Grenoble, France
+*
+* Component: Frame_monitor_json
+*
+* %I
+* Written by:  GS Tucker
+* Date: 2023
+* Origin: European Spallation Source ERIC
+*
+* Rectangular Time-of-flight monitor that bins per source-frame and sends
+* output as JSON via a user-specified command
+*
+* %D
+*
+* %P
+* INPUT PARAMETERS:
+*
+* xmin: [m]             Lower x bound of detector opening
+* xmax: [m]             Upper x bound of detector opening
+* ymin: [m]             Lower y bound of detector opening
+* ymax: [m]             Upper y bound of detector opening
+* xwidth: [m]           Width of detector. Overrides xmin, xmax
+* yheight: [m]          Height of detector. Overrides ymin, ymax
+* nt: [1]               Number of time bins
+* dt: [mu-s]            Length of each time bin
+* frame: [mu-s]         Duration of one frame
+* frequency: [Hz]       Source (modulus) frequency, overrides frame length
+* filename: [string]    Name of file in which to store the detector image
+* restore_neutron: [1]  If set, the monitor does not influence the neutron state
+* writefile: [0]        If set to 0, monitor will skip writing to disk, default = 0
+* command: [string]     The command to send JSON data, e.g., "mccode-to-kafka json"
+*
+* %E
+*******************************************************************************/
+
+DEFINE COMPONENT Frame_monitor_json
+
+DEFINITION PARAMETERS ()
+
+SETTING PARAMETERS (frame=0, frequency=0, dt=0, int nt=20, 
+                    string filename=0, xmin=-0.05, xmax=0.05, ymin=-0.05, ymax=0.05,
+		    xwidth=0, yheight=0, restore_neutron=0, int writefile=0, string command=0)
+
+OUTPUT PARAMETERS ()
+/* Neutron parameters: (x,y,z,vx,vy,vz,t,sx,sy,sz,p) */
+
+
+DEPENDENCY "-ljson-c"
+
+SHARE
+%{
+#include <json-c/json.h>
+
+json_object * frame_monitor_setup_json(json_object * root, double period, double tick, int nt) {
+  char xvar[] = "t";
+  char xlabel[] = "Time-of-flight [\\gms]";
+  char ylabel[] = "Intensity";
+  char buf[1024];
+
+  json_object * metadata = json_object_new_object();
+  json_object * parameters = json_object_new_object();
+  json_object * variables = json_object_new_array();
+  json_object * data = json_object_new_array();
+  // check that all objects are allocated?
+  json_object_object_add(root, "id", json_object_new_null());
+  json_object_object_add(root, "source", json_object_new_string("Frame_monitor_json runtime"));
+  // Add the objects/arrays to the root:
+  json_object_object_add(root, "metadata", metadata);
+  json_object_object_add(root, "parameters", parameters);
+  json_object_object_add(root, "variables", variables);
+  json_object_object_add(root, "data", data);
+  // Fill-in the metadata (only what mccode-to-kafka needs)
+  // we're truncating drastically :/
+  json_object_object_add(metadata, "xvar", json_object_new_string(xvar));
+  json_object_object_add(metadata, "xlabel", json_object_new_string(xlabel));
+  json_object_object_add(metadata, "ylabel", json_object_new_string(ylabel));
+  sprintf(buf, "%f %f", 0., period);
+  json_object_object_add(metadata, "xlimits", json_object_new_string(buf));
+  sprintf(buf, "array_1d(%d)", nt);
+  json_object_object_add(metadata, "type", json_object_new_string(buf));
+  // Fill-in the parameters (skip since mccode-to-kafka does not use them)
+  // Fill-in "variables": ["t", "I", "I_err", "N"]
+  json_object_array_add(variables, json_object_new_string(xvar));
+  json_object_array_add(variables, json_object_new_string("I"));
+  json_object_array_add(variables, json_object_new_string("I_err"));
+  json_object_array_add(variables, json_object_new_string("N"));
+  // "data": [[xdata], [I], [I_err], [N]] -- add I, I_err, N, later
+  json_object * xdata = json_object_new_array();
+  for (int i=0; i<nt; ++i){
+    json_object_array_add(xdata, json_object_new_double(tick * (double)i));
+  }
+  json_object_array_add(data, xdata);
+
+  return data;
+}
+
+int frame_monitor_send_json(char * command, json_object * json_root){
+  const char * json_string = json_object_to_json_string(json_root);
+  char * cmd = calloc(strlen(command) + 3 + strlen(json_string), sizeof(char));
+  sprintf(cmd, "%s '%s'", command, json_string);
+  int retval = system(cmd);
+  free(cmd);
+  return retval / 256;
+}
+
+%}
+
+DECLARE
+%{
+  DArray1d TOF_N;
+  DArray1d TOF_p;
+  DArray1d TOF_w;
+  double period;
+  double tick;
+  int n_bins;
+  int send_json;
+  json_object * json_root;
+  json_object * json_data;
+%}
+
+INITIALIZE
+%{
+  if (xwidth  > 0) { xmax = xwidth/2;  xmin = -xmax; }
+  if (yheight > 0) { ymax = yheight/2; ymin = -ymax; }
+
+  if ((xmin >= xmax) || (ymin >= ymax)) {
+          printf("Frame_monitor: %s: Null detection area !\n"
+                 "ERROR        (xwidth,yheight,xmin,xmax,ymin,ymax). Exiting",
+         NAME_CURRENT_COMP);
+    exit(0);
+  }
+  
+  // Allow defining the repetition rate of the source or the frame duration
+  period = frequency > 0 ? 1e6 / frequency : frame;
+  // Allow defining number of bins *or* bin duration, with duration taking precedence
+  n_bins = fabs(dt) > 0 ? (int) fabs(ceil(period / dt)) : nt;
+  // then the width of each bin is
+  tick = period / (double) n_bins;
+  
+  TOF_N = create_darr1d(n_bins);
+  TOF_p = create_darr1d(n_bins);
+  TOF_w = create_darr1d(n_bins);
+
+  for(int i=0; i < n_bins; ++i) {
+    TOF_N[i] = 0;
+    TOF_p[i] = 0;
+    TOF_w[i] = 0;
+  }
+
+  // Use instance name for monitor output if no input was given
+  if (!strcmp(filename, "\0")) sprintf(filename, "%s", NAME_CURRENT_COMP);
+
+  send_json = strcmp(command, "\0") ? 1 : 0;
+  if (send_json){
+    json_root = json_object_new_object();
+    json_data = frame_monitor_setup_json(json_root, period, tick, nt);
+  }
+%}
+
+TRACE
+%{
+  PROP_Z0;
+  if (x > xmin && x < xmax && y > ymin && y < ymax)
+  {
+    int i = floor(fmod(1E6 * t, period) / tick);
+    if(i >= 0 && i < n_bins) {
+      #pragma acc atomic      
+      TOF_N[i] = TOF_N[i] + 1;
+      #pragma acc atomic
+      TOF_p[i] = TOF_p[i] + p;
+      #pragma acc atomic      
+      TOF_w[i] = TOF_w[i] + p * p;
+      SCATTER;
+    }
+  }
+  if (restore_neutron) {
+    RESTORE_NEUTRON(INDEX_CURRENT_COMP, x, y, z, vx, vy, vz, t, sx, sy, sz, p);
+  }
+%}
+
+SAVE
+%{
+  char title[] = "Frame monitor";
+  char xvar[] = "t";
+  char xlabel[] = "Time-of-flight [\\gms]";
+  char ylabel[] = "Intensity";
+  if(writefile != 0) {
+  DETECTOR_OUT_1D(title, xlabel, ylabel, 
+		  xvar, 0.0, period, nt, 
+		  &TOF_N[0],&TOF_p[0],&TOF_w[0],
+		  filename);
+  }
+  if (send_json) {
+    // in case we have saved before (e.g., SIGUSR2); clear out the I, I_err, and N arrays
+    size_t json_length = json_object_array_length(json_data);
+    if (json_length > 1){
+      json_object_array_del_idx(json_data, 1, json_length - 1);
+    }
+    // insert the current values of (I, I_err, N) arrays !! their order is important
+    json_object * idata = json_object_new_array();
+    json_object * edata = json_object_new_array();
+    json_object * ndata = json_object_new_array();
+    for (int i=0; i<nt; ++i){
+      json_object_array_add(idata, json_object_new_double(TOF_p[i])); 
+      json_object_array_add(edata, json_object_new_double(TOF_w[i])); 
+      json_object_array_add(ndata, json_object_new_double(TOF_N[i])); 
+    }
+    json_object_array_add(json_data, idata);
+    json_object_array_add(json_data, edata);
+    json_object_array_add(json_data, ndata);
+    // build the full command and execute it:
+    frame_monitor_send_json(command, json_root);
+  }
+%}
+
+FINALLY
+%{
+  destroy_darr1d(TOF_N);
+  destroy_darr1d(TOF_p);
+  destroy_darr1d(TOF_w);
+  // clean-up the JSON structure
+  if (send_json) json_object_put(json_root);
+%}
+
+MCDISPLAY
+%{
+
+  multiline(5, (double)xmin, (double)ymin, 0.0,
+               (double)xmax, (double)ymin, 0.0,
+               (double)xmax, (double)ymax, 0.0,
+               (double)xmin, (double)ymax, 0.0,
+               (double)xmin, (double)ymin, 0.0);
+%}
+
+END
